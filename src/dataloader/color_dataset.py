@@ -7,12 +7,14 @@ from skimage import color
 
 
 class ColorizationDataset(Dataset):
-    def __init__(self, root, extensions=('.jpg', '.jpeg', '.png')):
+    def __init__(self, root, extensions=('.jpg', '.jpeg', '.png'), img_size=256):
         self.root = Path(root)
         self.images = [p for p in self.root.rglob('*') if p.suffix.lower() in extensions]
+        self.img_size = img_size
 
     def __getitem__(self, idx):
         img = Image.open(self.images[idx]).convert('RGB')
+        img = img.resize((self.img_size, self.img_size))
         lab = color.rgb2lab(np.array(img))
         return torch.FloatTensor(np.transpose(lab, (2, 0, 1))), 0
 
