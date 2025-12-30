@@ -12,6 +12,8 @@ import torchvision
 import numpy as np
 import torch
 from torch.optim import Adam
+from torch.amp.grad_scaler import GradScaler
+from torch.amp.autocast_mode import autocast
 from torch import cuda
 import os
 from datetime import datetime
@@ -26,10 +28,12 @@ parser.add_argument("--weight-decay", type=float, default=1e-3)
 parser.add_argument("--num-workers", type=int, default=4)
 parser.add_argument("--gpu", type=int, default=-1)
 parser.add_argument("--dataroot", type=str, default="./data")
-parser.add_argument("--dataset", type=str, default="stl10", choices=["stl10", "cifar-10"])
+parser.add_argument("--dataset", type=str, default="stl10", choices=["stl10", "cifar-10", "custom"])
 parser.add_argument("--checkpoint_dir", type=str, default="./out")
 parser.add_argument("--train-path", type=str, default=None, help="Path to custom training images")
 parser.add_argument("--val-path", type=str, default=None, help="Path to custom validation images")
+parser.add_argument("--amp", action="store_true", help="Use automatic mixed precision training")
+parser.add_argument("--grad-accum", type=int, default=1, help="Gradient accumulation steps")
 
 def set_device(gpu):
     use_gpu = args.gpu != -1 and torch.cuda.is_available()
@@ -64,9 +68,13 @@ def get_dataloaders(dataset, dataroot, batch_size, num_workers, train_path=None,
                                                 download=True, transform=transform)
     
     trainloader = torch.utils.data.DataLoader(traindataset, batch_size=batch_size,
-                                            shuffle=True, num_workers=num_workers)
+                                            shuffle=True, num_workers=num_workers,
+                                            pin_memory=True, prefetch_factor=2 if num_workers > 0 else None,
+                                            persistent_workers=True if num_workers > 0 else False)
     testloader = torch.utils.data.DataLoader(testdataset, batch_size=batch_size,
-                                            shuffle=True, num_workers=num_workers) if testdataset else None
+                                            shuffle=False, num_workers=num_workers,
+                                            pin_memory=True, prefetch_factor=2 if num_workers > 0 else None,
+                                            persistent_workers=True if num_workers > 0 else False) if testdataset else None
     
     return trainloader, testloader
 
@@ -95,36 +103,48 @@ if __name__ == "__main__":
     weight_decay = args.weight_decay
 
     optimizer = Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    scaler = GradScaler(enabled=args.amp)
     train_loss = []
     test_loss = []
+    grad_accum_steps = args.grad_accum
 
     for epoch in range(epochs):
         print("Epoch {}".format(epoch))
         model.train()
         train_loss.append(0)
+        optimizer.zero_grad()
         with tqdm(total=TRAIN_SIZE) as pbar:
             for i, data in enumerate(trainloader):
                 inputs, _ = data
-                inputs = inputs.to(device)
+                inputs = inputs.to(device, non_blocking=True)
                 l, ab = inputs[:, 0, :, :], inputs[:, 1:, :, :]
                 l = l.unsqueeze(1)
-                prediction = model(l)
-                prediction = prediction.permute(0, 2, 3, 1)
+                
+                with autocast(device_type=device.type, enabled=args.amp):
+                    prediction = model(l)
+                    prediction = prediction.permute(0, 2, 3, 1)
 
-                ground_truth = ab_to_z(ab, hull)
-                pixelwise_weights = reweight(ground_truth, weights)
+                    ground_truth = ab_to_z(ab, hull)
+                    pixelwise_weights = reweight(ground_truth, weights)
 
-                loss = -torch.sum(pixelwise_weights * torch.sum(ground_truth * torch.nn.functional.log_softmax(prediction, dim=-1), dim=-1), dim=(-1, -2))
-                loss = torch.mean(loss)
+                    loss = -torch.sum(pixelwise_weights * torch.sum(ground_truth * torch.nn.functional.log_softmax(prediction, dim=-1), dim=-1), dim=(-1, -2))
+                    loss = torch.mean(loss) / grad_accum_steps
 
-                optimizer.zero_grad()
-                loss.backward()
+                scaler.scale(loss).backward()
+                
+                if (i + 1) % grad_accum_steps == 0:
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad()
 
-                optimizer.step()
-
-                # train_loss.append(loss.item())
-                train_loss[-1] += loss.item()
+                train_loss[-1] += loss.item() * grad_accum_steps
                 pbar.update(1)
+            
+            # Handle remaining gradients
+            if (i + 1) % grad_accum_steps != 0:
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
             
             pbar.close()
 
@@ -137,9 +157,9 @@ if __name__ == "__main__":
             test_loss.append(0)
             for i, data in enumerate(testloader):
 
-                with torch.no_grad():
+                with torch.no_grad(), autocast(device_type=device.type, enabled=args.amp):
                     inputs, _ = data
-                    inputs = inputs.to(device)
+                    inputs = inputs.to(device, non_blocking=True)
                     l, ab = inputs[:, 0, :, :], inputs[:, 1:, :, :]
                     l = l.unsqueeze(1)
                     prediction = model(l)
@@ -151,7 +171,6 @@ if __name__ == "__main__":
                     loss = -torch.sum(pixelwise_weights * torch.sum(ground_truth * torch.nn.functional.log_softmax(prediction, dim=-1), dim=-1), dim=(-1, -2))
                     loss = torch.mean(loss)
 
-                    # test_loss.append(loss.item())
                     test_loss[-1] += loss.item()
 
                     pbar.update(1)
