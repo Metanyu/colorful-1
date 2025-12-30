@@ -10,6 +10,7 @@ import torch
 from argparse import ArgumentParser
 
 from src.colour.soft_encode import soft_encode
+from src.dataloader.color_dataset import ColorizationDataset
 
 parser = ArgumentParser()
 parser.add_argument("--batch-size", type=int, default=64)
@@ -18,7 +19,9 @@ parser.add_argument("--uniform-lambda", type=float, default=0.5)
 parser.add_argument("--gaussian-sigma", type=float, default=5)
 parser.add_argument("--dataroot", type=str, default="./data")
 parser.add_argument("--gpu", type=int, default=-1)
-parser.add_argument("--dataset", type=str, default="stl10", choices=["stl10", "cifar-10"])
+parser.add_argument("--dataset", type=str, default="stl10", choices=["stl10", "cifar-10", "custom"])
+parser.add_argument("--train-path", type=str, default=None, help="Path to custom training images")
+parser.add_argument("--val-path", type=str, default=None, help="Path to custom validation images")
 
 def set_device(gpu):
     use_gpu = args.gpu != -1 and torch.cuda.is_available()
@@ -30,7 +33,7 @@ def set_device(gpu):
 
     return device
 
-def get_dataloaders(dataset, dataroot, batch_size, num_workers):
+def get_dataloaders(dataset, dataroot, batch_size, num_workers, train_path=None, val_path=None):
     def import_image(img):
         return torch.FloatTensor(np.transpose(color.rgb2lab(np.array(img)), (2,0,1)))
     
@@ -38,7 +41,10 @@ def get_dataloaders(dataset, dataroot, batch_size, num_workers):
         transforms.Lambda(import_image),
     ])
 
-    if dataset == "stl10":
+    if dataset == "custom":
+        traindataset = ColorizationDataset(root=train_path)
+        testdataset = ColorizationDataset(root=val_path) if val_path else None
+    elif dataset == "stl10":
         traindataset = torchvision.datasets.STL10(root=dataroot, split='unlabeled',
                                                 download=True, transform=transform)
         testdataset = torchvision.datasets.STL10(root=dataroot, split='test',
@@ -52,7 +58,7 @@ def get_dataloaders(dataset, dataroot, batch_size, num_workers):
     trainloader = torch.utils.data.DataLoader(traindataset, batch_size=batch_size,
                                             shuffle=True, num_workers=num_workers)
     testloader = torch.utils.data.DataLoader(testdataset, batch_size=batch_size,
-                                            shuffle=True, num_workers=num_workers)
+                                            shuffle=True, num_workers=num_workers) if testdataset else None
     
     return trainloader, testloader
 
@@ -63,7 +69,8 @@ if __name__ == "__main__":
     
     hull = torch.from_numpy(np.load("data/hull.npy")).to(device)
 
-    trainloader, _ = get_dataloaders(args.dataset, args.dataroot, args.batch_size, args.num_workers)
+    trainloader, _ = get_dataloaders(args.dataset, args.dataroot, args.batch_size, args.num_workers,
+                                      args.train_path, args.val_path)
 
     TRAIN_SIZE = len(trainloader)
 
